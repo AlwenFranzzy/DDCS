@@ -1,244 +1,208 @@
-"""
-qlearning_module.py
--------------------
-Q-learning module with model-assisted safety for the Modular Wastewater project.
-
-Functions:
-- discretize_state(state, env, n_bins_level=10)
-- q_learning_model_assisted(env, mlp_model, scaler, n_bins_level=10,
-                            episodes=2000, steps_per_episode=24*7, verbose=True)
-- get_greedy_policy_from_qtable(q_table, env, n_bins_level=10)
-- simulate_policy(policy_fn, env_seed=None, total_hours=24*7*2, env_kwargs=None)
-"""
-
+# qlearning_module.py
 import numpy as np
-import random
-from typing import Callable, Tuple, List
 
-# We import WastewaterEnv lazily in the __main__ demo to avoid circular import if not needed.
-# from env_module import WastewaterEnv
-
-# ----------------------------
-# State discretization
-# ----------------------------
-def discretize_state(state: Tuple[float, int, int], env, n_bins_level: int = 10) -> Tuple[int, int, int]:
+def discretize_state(pdam_used, recycled, env, n_bins_recycled=20):
     """
-    Discretize continuous state (level, hour, day) to indices for Q-table.
+    Melakukan diskretisasi state continuous menjadi indeks diskrit agar bisa
+    digunakan pada Q-table.
+    
+    Parameter:
+    - pdam_used       : jumlah PDAM yang digunakan pada langkah sebelumnya (float)
+    - recycled        : jumlah recycled water saat ini
+    - env             : environment untuk membaca kapasitas tank
+    - n_bins_recycled : jumlah bin diskret untuk variabel recycled
 
-    level -> n_bins_level bins (0 .. n_bins_level-1) scaled by env.tank_capacity
-    hour  -> 0..23
-    day   -> 0..6
+    Output:
+    - (recycled_bin, pdam_flag)
+      recycled_bin : indeks bin hasil diskretisasi stok air daur ulang
+      pdam_flag    : 1 jika sebelumnya menggunakan PDAM, 0 jika tidak
     """
-    level, hour, day = state
-    # Normalize and convert to bin index
-    frac = 0.0
-    if env.tank_capacity > 0:
-        frac = float(level) / float(env.tank_capacity)
-    # clamp between 0 and 1
-    frac = max(0.0, min(1.0, frac))
-    level_bin = int(min(n_bins_level - 1, int(frac * n_bins_level)))
-    hour_i = int(hour) % 24
-    day_i = int(day) % 7
-    return (level_bin, hour_i, day_i)
 
-# ----------------------------
-# Q-Learning with model-assisted safety
-# ----------------------------
-def q_learning_model_assisted(env,
-                              mlp_model,
-                              scaler,
-                              n_bins_level: int = 10,
-                              episodes: int = 2000,
-                              steps_per_episode: int = 24*7,
-                              alpha: float = 0.1,
-                              gamma: float = 0.95,
-                              epsilon_start: float = 1.0,
-                              epsilon_min: float = 0.05,
-                              verbose: bool = True) -> Tuple[np.ndarray, List[float]]:
+    # Clamp recycled agar tetap dalam kapasitas
+    recycled = max(0.0, min(env.tank_capacity, recycled))
+
+    # Hitung ukuran tiap bin
+    bin_size = env.tank_capacity / n_bins_recycled
+
+    # Tentukan posisi recycled pada bin
+    recycled_bin = int(recycled / bin_size)
+    if recycled_bin >= n_bins_recycled:
+        recycled_bin = n_bins_recycled - 1
+
+    # Flag apakah PDAM digunakan pada step sebelumnya
+    pdam_flag = 1 if pdam_used > 0 else 0
+
+    return (recycled_bin, pdam_flag)
+
+
+def q_learning_model_assisted(env, mlp_model, scaler, episodes=10000, steps_per_episode=24,
+                              alpha=0.1, gamma=0.99, epsilon_start=1.0, epsilon_min=0.05):
     """
-    Train a tabular Q-learning agent with an MLP-based safety penalty.
+    Q-learning dengan bantuan model MLP (model-assisted RL).
+    Model digunakan untuk memberikan shaping reward tambahan berdasarkan prediksi
+    peningkatan stok recycled water.
 
-    Parameters
-    ----------
-    env : WastewaterEnv
-        Environment instance (must implement reset() and step(action)).
-    mlp_model : sklearn-like regressor
-        Model predicting next tank level; used to anticipate overflow.
-    scaler : sklearn.preprocessing.StandardScaler
-        Scaler used to transform features before passing to mlp_model.
-    n_bins_level : int
-        Number of discretization bins for tank level.
-    episodes : int
-        Number of training episodes.
-    steps_per_episode : int
-        Steps per episode.
-    alpha, gamma : float
-        Learning rate and discount factor.
-    epsilon_start, epsilon_min : float
-        Epsilon-greedy exploration parameters.
-    verbose : bool
-        Print periodic progress.
+    Parameter:
+    - env             : environment simulasi
+    - mlp_model       : model MLP yang memprediksi next_recycled
+    - scaler          : scaler untuk menormalisasi fitur input MLP
+    - episodes        : jumlah episode training
+    - steps_per_episode : jumlah langkah setiap episode (default 24 jam)
+    - alpha           : learning rate
+    - gamma           : discount factor
+    - epsilon_start   : nilai awal epsilon (exploration)
+    - epsilon_min     : nilai minimal epsilon
 
-    Returns
-    -------
-    q_table : np.ndarray
-        Learned Q-table shape (n_bins_level, 24, 7, n_actions).
-    rewards : list[float]
-        Episode cumulative (combined) rewards.
+    Output:
+    - q_table : tabel Q-learning berukuran [bins x pdam_flag x actions]
+    - rewards_history : akumulasi reward setiap episode
     """
+
+    n_bins = 20
     n_actions = 3
-    q_table = np.zeros((n_bins_level, 24, 7, n_actions), dtype=float)
+
+    # Q-table: [bin_recycled, pdam_flag, action]
+    q_table = np.zeros((n_bins, 2, n_actions))
 
     epsilon = epsilon_start
-    decay = (epsilon_start - epsilon_min) / max(1, episodes)
-    rewards = []
+    rewards_history = []
 
     for ep in range(episodes):
-        state = env.reset()
-        s_idx = discretize_state(state, env, n_bins_level)
+        # Reset environment tiap episode
+        s = env.reset()
+        pdam_prev, recycled, hour, day = s
+
+        # Diskretisasi state awal
+        s_idx = discretize_state(pdam_prev, recycled, env, n_bins_recycled=n_bins)
+
         ep_reward = 0.0
 
-        for _ in range(steps_per_episode):
-            # epsilon-greedy
-            if random.random() < epsilon:
-                action = random.choice([0, 1, 2])
+        for step in range(steps_per_episode):
+
+            # --- Pilih aksi menggunakan epsilon-greedy ---
+            if np.random.rand() < epsilon:
+                action = np.random.choice(n_actions)  # eksplorasi
             else:
-                action = int(np.argmax(q_table[s_idx]))
+                action = int(np.argmax(q_table[s_idx]))  # eksploitasi
 
-            # Step environment with chosen action
-            next_state, reward, _, info = env.step(action)
+            # Jalankan environment
+            next_state, reward, done, info = env.step(action)
+            pdam_next, recycled_next, hour_next, day_next = next_state
 
-            # Model-assisted safety: predict next level and penalize predicted overflow
-            feat = np.array([[state[0], state[1], state[2], info['inflow'], action]])
-            try:
-                feat_scaled = scaler.transform(feat)
-                pred_next = float(mlp_model.predict(feat_scaled)[0])
-            except Exception:
-                # If model/scaler fail, fallback to no safety prediction
-                pred_next = next_state[0]
+            # ------------------------------------------------------------------
+            #          Model-Assisted Reward Shaping
+            # ------------------------------------------------------------------
+            # Fitur input ke MLP: kondisi sekarang + aksi + demand
+            feat = [[pdam_prev, recycled, hour, day, action, info['demand']]]
 
-            predicted_overflow = max(0.0, pred_next - env.tank_capacity)
-            safety_penalty = - (predicted_overflow / env.tank_capacity) * 0.5  # scale penalty
+            # Normalisasi fitur
+            feat_scaled = scaler.transform(feat)
 
-            combined_reward = reward + safety_penalty
+            # Prediksi jumlah recycled setelah aksi
+            pred_next_recycled = mlp_model.predict(feat_scaled)[0]
 
-            # Q-learning update
-            ns_idx = discretize_state(next_state, env, n_bins_level)
+            # Hitung pertumbuhan recycled yang diprediksi
+            recycled_growth = pred_next_recycled - recycled
+
+            # Bonus reward jika prediksi menunjukkan peningkatan recycled
+            growth_bonus = max(0.0, recycled_growth / (env.tank_capacity + 1e-9)) * 1.5
+
+            # Kombinasikan reward RL murni dengan reward shaping
+            combined_reward = reward + growth_bonus
+
+            # ------------------------------------------------------------------
+            #                       Q-table Update
+            # ------------------------------------------------------------------
+            ns_idx = discretize_state(pdam_next, recycled_next, env, n_bins_recycled=n_bins)
+
             old_q = q_table[s_idx + (action,)]
             td_target = combined_reward + gamma * np.max(q_table[ns_idx])
+
+            # Update rule Q-learning
             q_table[s_idx + (action,)] = old_q + alpha * (td_target - old_q)
 
-            # advance
-            state = next_state
+            # Update state
+            pdam_prev, recycled, hour, day = pdam_next, recycled_next, hour_next, day_next
             s_idx = ns_idx
             ep_reward += combined_reward
 
-        # update epsilon
-        epsilon = max(epsilon_min, epsilon - decay)
-        rewards.append(ep_reward)
+        # Kurangi epsilon setiap episode (exploration decay)
+        epsilon = max(epsilon_min, epsilon * 0.995)
 
-        if verbose and ((ep + 1) % max(1, episodes // 10) == 0 or ep == 0):
-            recent = np.mean(rewards[-10:]) if len(rewards) >= 1 else 0.0
-            print(f"Episode {ep+1}/{episodes}, avg reward last10: {recent:.4f}, epsilon: {epsilon:.3f}")
+        # Simpan total reward episode
+        rewards_history.append(ep_reward)
 
-    return q_table, rewards
+    return q_table, rewards_history
 
-# ----------------------------
-# Helpers: policies & simulation
-# ----------------------------
-def get_greedy_policy_from_qtable(q_table: np.ndarray, env, n_bins_level: int = 10) -> Callable:
+
+def get_greedy_policy_from_qtable(q_table, env):
     """
-    Return a policy function (state, env) -> action that picks the greedy action
-    from the provided q_table.
+    Menghasilkan policy deterministik (greedy) dari Q-table,
+    yaitu memilih aksi bernilai Q tertinggi untuk setiap state.
     """
-    def policy_fn(state, _env):
-        idx = discretize_state(state, env, n_bins_level)
+
+    def policy(state, _env=None):
+        pdam_prev, recycled, hour, day = state
+        idx = discretize_state(pdam_prev, recycled, env, n_bins_recycled=q_table.shape[0])
         return int(np.argmax(q_table[idx]))
-    return policy_fn
 
-def simulate_policy(policy_fn: Callable,
-                    env_seed: int = None,
-                    total_hours: int = 24*7*2,
-                    env_class=None,
-                    env_kwargs: dict = None):
+    return policy
+
+
+def simulate_policy(env, policy_fn, total_hours=24*7):
     """
-    Simulate a policy for a number of hours and collect stats.
+    Simulasi policy dalam environment untuk jangka waktu tertentu.
+    Menghasilkan statistik total penggunaan PDAM, recycled, dan trace level tank.
 
-    Parameters
-    ----------
-    policy_fn : callable
-        Function(policy_state, env) -> action
-    env_seed : int | None
-        Seed for environment (optional)
-    total_hours : int
-        Number of steps to simulate
-    env_class : class
-        Environment class to instantiate (must accept seed in kwargs).
-    env_kwargs : dict
-        Additional kwargs passed to env_class constructor.
-
-    Returns
-    -------
-    levels : np.ndarray
-        Recorded tank levels after each step.
-    wasted_total : float
-        Total wasted water (overflow + released).
-    plants_total : float
-        Total water used for plants.
+    Output dictionary berisi:
+    - pdam_total
+    - recycled_used_total
+    - recycled_trace
+    - pdam_used_list
+    - recycled_used_list
+    - time_steps
     """
-    if env_class is None:
-        raise ValueError("env_class must be provided (e.g., env_module.WastewaterEnv)")
 
-    if env_kwargs is None:
-        env_kwargs = {}
-    if env_seed is not None:
-        env_kwargs = dict(env_kwargs, seed=env_seed)
+    state = env.reset()
+    pdam_prev, recycled, hour, day = state
 
-    e = env_class(**env_kwargs)
-    s = e.reset()
-    levels = []
-    wasted_total = 0.0
-    plants_total = 0.0
+    pdam_total = 0.0
+    recycled_total_used = 0.0
+    recycled_trace = []
 
-    for _ in range(total_hours):
-        a = policy_fn(s, e)
-        s, _, _, info = e.step(a)
-        levels.append(e.tank_level)
-        wasted_total += info.get('wasted_overflow', 0.0) + info.get('wasted_action', 0.0)
-        plants_total += info.get('water_used_plants', 0.0)
+    # List untuk visualisasi
+    pdam_used_list = []
+    recycled_used_list = []
+    time_steps = []
 
-    return np.array(levels), wasted_total, plants_total
+    for t in range(total_hours):
+        # Pilih aksi berdasarkan policy
+        action = policy_fn(state, env)
 
-# ----------------------------
-# Demo: run training if executed directly
-# ----------------------------
-if __name__ == "__main__":
-    # Quick demo that uses env_module, data_module and model_module to train MLP then run Q-learning.
-    from environment import WastewaterEnv
-    from data import collect_data
-    from model import train_mlp
+        # Jalankan environment
+        next_state, reward, done, info = env.step(action)
 
-    # 1) Prepare data & model (light / quick demo)
-    env_demo = WastewaterEnv(tank_capacity=100.0, seed=42)
-    df_demo = collect_data(env_demo, n_steps=2000)
-    mlp_model, scaler, score = train_mlp(df_demo)
+        # Ambil data penggunaan air
+        pdam_used = info['pdam_used']
+        recycled_used = info['recycled_used']
 
-    # 2) Q-learning
-    env_rl = WastewaterEnv(tank_capacity=100.0, seed=123)
-    q_table, rewards = q_learning_model_assisted(env_rl, mlp_model, scaler,
-                                                 n_bins_level=10, episodes=200, steps_per_episode=24*3,
-                                                 verbose=True)
+        # Akumulasikan statistik
+        pdam_total += pdam_used
+        recycled_total_used += recycled_used
+        recycled_trace.append(next_state[1])  # stok recycled tiap waktu
 
-    # 3) Evaluate policies
-    greedy_policy = get_greedy_policy_from_qtable(q_table, env_rl, n_bins_level=10)
-    dummy = lambda s, e: 0
+        # Simpan untuk plotting
+        pdam_used_list.append(pdam_used)
+        recycled_used_list.append(recycled_used)
+        time_steps.append(t)
 
-    levels_dummy, wasted_dummy, plants_dummy = simulate_policy(dummy, env_seed=7,
-                                                               env_class=WastewaterEnv,
-                                                               env_kwargs={'tank_capacity': 100.0})
-    levels_learned, wasted_learned, plants_learned = simulate_policy(greedy_policy, env_seed=7,
-                                                                     env_class=WastewaterEnv,
-                                                                     env_kwargs={'tank_capacity': 100.0})
+        state = next_state
 
-    print("Wasted - dummy:", wasted_dummy, "learned:", wasted_learned)
-    print("Plants - dummy:", plants_dummy, "learned:", plants_learned)
+    return {
+        "pdam_total": pdam_total,
+        "recycled_used_total": recycled_total_used,
+        "recycled_trace": recycled_trace,
+        "pdam_used_list": pdam_used_list,
+        "recycled_used_list": recycled_used_list,
+        "time_steps": time_steps,
+    }
