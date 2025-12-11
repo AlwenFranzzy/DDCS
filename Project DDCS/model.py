@@ -1,83 +1,71 @@
-"""
-model_module.py
-----------------
-System Identification Module using MLP.
-
-Contains:
-- train_mlp(): trains a neural network (MLPRegressor)
-  to model the wastewater system dynamics.
-"""
-
-import numpy as np
-import pandas as pd
+# model.py
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.neural_network import MLPRegressor
-from sklearn.model_selection import train_test_split
+import numpy as np
 
-# ----------------------------
-# MLP Training Function
-# ----------------------------
-def train_mlp(df):
+def train_mlp(df, random_state=1):
     """
-    Train a Multi-Layer Perceptron (MLP) model to predict next tank level
-    based on current state and action.
+    Melatih model MLPRegressor untuk memprediksi next_recycled
+    berdasarkan fitur:
+    [pdam_prev, recycled_before, hour, day, action, demand]
 
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Dataset containing columns:
-        ['level','hour','day','inflow','action','next_level']
+    Parameter:
+    - df : DataFrame hasil koleksi data (data.py)
+    - random_state : untuk memastikan hasil training konsisten
 
-    Returns
-    -------
-    model : MLPRegressor
-        Trained MLP model.
-    scaler : StandardScaler
-        Fitted scaler for input normalization.
-    score : float
-        R^2 test score of model on held-out test set.
+    Output:
+    - model  : model MLP terlatih
+    - scaler : normalizer fitur (StandardScaler)
+    - score  : skor R^2 pada data test untuk evaluasi performa model
     """
 
-    # === 1. Pisahkan fitur dan target ===
-    X = df[['level', 'hour', 'day', 'inflow', 'action']].values
-    y = df['next_level'].values
+    # ----------------------------------------------------------------------
+    # 1. Ekstraksi fitur input (X) dan target output (y)
+    # ----------------------------------------------------------------------
+    X = df[['pdam_prev', 'recycled_before', 'hour', 'day', 'action', 'demand']].values
+    y = df['next_recycled'].values
 
-    # === 2. Standarisasi fitur (agar training stabil) ===
+    # ----------------------------------------------------------------------
+    # 2. Normalisasi fitur dengan StandardScaler
+    #    - penting karena MLP sensitif terhadap skala fitur
+    # ----------------------------------------------------------------------
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    Xs = scaler.fit_transform(X)
 
-    # === 3. Split data menjadi train/test ===
-    Xtr, Xte, ytr, yte = train_test_split(X_scaled, y, test_size=0.2, random_state=1)
-
-    # === 4. Definisikan arsitektur MLP ===
-    model = MLPRegressor(
-        hidden_layer_sizes=(64, 32),
-        activation='relu',
-        solver='adam',
-        max_iter=500,
-        random_state=1
+    # ----------------------------------------------------------------------
+    # 3. Split data menjadi train (80%) dan test (20%)
+    #    - train : untuk melatih model
+    #    - test  : untuk evaluasi generalisasi model
+    # ----------------------------------------------------------------------
+    Xtr, Xte, ytr, yte = train_test_split(
+        Xs, y, test_size=0.2, random_state=random_state
     )
 
-    # === 5. Training ===
+    # ----------------------------------------------------------------------
+    # 4. Definisi arsitektur MLP
+    #    hidden_layer_sizes = (64, 32)
+    #      → layer 1: 64 neuron, layer 2: 32 neuron
+    #
+    #    max_iter = 500 → maksimum iterasi training
+    # ----------------------------------------------------------------------
+    model = MLPRegressor(
+        hidden_layer_sizes=(64, 32),
+        max_iter=500,
+        random_state=random_state
+    )
+
+    # ----------------------------------------------------------------------
+    # 5. Training model pada data training
+    # ----------------------------------------------------------------------
     model.fit(Xtr, ytr)
 
-    # === 6. Evaluasi (R² score) ===
+    # ----------------------------------------------------------------------
+    # 6. Evaluasi model pada data test menggunakan skor R^2
+    #    R^2 = 1 → prediksi sempurna
+    #    R^2 = 0 → sama seperti rata-rata
+    #    R^2 < 0 → performa buruk
+    # ----------------------------------------------------------------------
     score = model.score(Xte, yte)
 
-    print(f"✅ MLP training done. Test R² = {score:.4f}")
     return model, scaler, score
-
-
-# ----------------------------
-# Example usage
-# ----------------------------
-if __name__ == "__main__":
-    # Example test using synthetic dataset
-    from environment import WastewaterEnv
-    from data import collect_data
-
-    env = WastewaterEnv(tank_capacity=100.0, seed=42)
-    df = collect_data(env, n_steps=2000)
-
-    model, scaler, score = train_mlp(df)
-    print("Model R² score:", score)
